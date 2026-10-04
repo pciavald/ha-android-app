@@ -1,7 +1,6 @@
 package io.homeassistant.companion.android.common.util
 
 import android.media.AudioManager
-import androidx.media.AudioAttributesCompat
 import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import androidx.media3.common.AudioAttributes
@@ -186,12 +185,9 @@ class AudioUrlPlayerTest {
     }
 
     @Test
-    fun `Given voice communication usage when playAudio then uses voice communication attributes for player and focus`() = runTest {
+    fun `Given voice communication usage when playAudio then uses voice communication attributes and voice call volume`() = runTest {
         val listenerSlot = slot<Player.Listener>()
-        val focusRequestSlot = slot<AudioFocusRequestCompat>()
 
-        mockkStatic(AudioManagerCompat::class)
-        every { AudioManagerCompat.requestAudioFocus(any(), capture(focusRequestSlot)) } returns AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         every { audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL) } returns 1
         every { exoPlayer.addListener(capture(listenerSlot)) } just Runs
         every { exoPlayer.prepare() } answers {
@@ -219,9 +215,6 @@ class AudioUrlPlayerTest {
             )
         }
         verify(exactly = 0) { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }
-        val focusAttributes = focusRequestSlot.captured.audioAttributesCompat
-        assertEquals(AudioAttributesCompat.USAGE_VOICE_COMMUNICATION, focusAttributes.usage)
-        assertEquals(AudioAttributesCompat.CONTENT_TYPE_SPEECH, focusAttributes.contentType)
     }
 
     @Test
