@@ -28,6 +28,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -134,16 +135,16 @@ abstract class AssistViewModelBase(
      * STT is supported _before_ calling this function)
      * @param pipeline information about the pipeline, or `null` to use the server's default
      * @param onEvent callback for events that should be use to update the UI
+     * @return the job collecting the run's events, active until the run ends or fails
      */
     protected fun runAssistPipelineInternal(
         text: String?,
         pipeline: AssistPipelineResponse?,
         wakeWordPhrase: String? = null,
         onEvent: (AssistEvent) -> Unit,
-    ) {
+    ): Job {
         val isVoice = text == null
-        var job: Job? = null
-        job = viewModelScope.launch {
+        return viewModelScope.launch {
             val flow = try {
                 if (isVoice) {
                     serverManager.webSocketRepository(selectedServerId).runAssistPipelineForVoice(
@@ -198,12 +199,12 @@ abstract class AssistViewModelBase(
 
                     AssistPipelineEventType.RUN_END -> {
                         stopRecording()
-                        job?.cancel()
+                        cancel()
                         onEvent(AssistEvent.PipelineEnded)
                     }
 
                     AssistPipelineEventType.ERROR -> if (handleError(event.data as? AssistPipelineError, onEvent)) {
-                        job?.cancel()
+                        cancel()
                     }
 
                     else -> {
