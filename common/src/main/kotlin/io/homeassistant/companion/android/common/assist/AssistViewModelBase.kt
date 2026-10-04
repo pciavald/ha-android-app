@@ -18,6 +18,7 @@ import io.homeassistant.companion.android.common.data.websocket.impl.entities.As
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineSttEnd
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineTtsEnd
 import io.homeassistant.companion.android.common.util.AudioUrlPlayer
+import io.homeassistant.companion.android.common.util.AudioUsage
 import io.homeassistant.companion.android.common.util.FailFast
 import io.homeassistant.companion.android.common.util.PlaybackState
 import io.homeassistant.companion.android.common.util.VOICE_SAMPLE_RATE
@@ -32,9 +33,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.transformWhile
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -57,6 +59,12 @@ sealed interface AssistEvent {
 
     /** Signals that TTS audio playback has finished */
     data object PlaybackFinished : AssistEvent
+
+    /**
+     * Signals that the run is over and nothing else follows it: the pipeline ended, no TTS playback
+     * is pending and the conversation does not continue. Emitted at most once per run.
+     */
+    data object TurnFinished : AssistEvent
 }
 
 abstract class AssistViewModelBase(
@@ -130,6 +138,35 @@ abstract class AssistViewModelBase(
     /** Whether TTS audio is currently being played back. Updated by playback handlers. */
     protected var isPlayingAudio = false
 
+    /** Audio usage of the TTS playback, read when each playback starts. */
+    protected open val ttsPlaybackUsage: AudioUsage
+        get() = AudioUsage.ASSISTANT
+
+    /**
+     * Suspends until the audio input is routed to the expected device, before the recorder starts
+     * capturing. Audio is buffered until the server is ready for it, so waiting here costs nothing
+     * as long as it returns before STT starts.
+     */
+    protected open suspend fun awaitInputRoute() = Unit
+
+    /**
+     * Tracks the end of a single pipeline run so that [AssistEvent.TurnFinished] is emitted once,
+     * only when the run ended, no playback is pending and the conversation does not continue.
+     * All its state is touched from the main thread.
+     */
+    private class RunTurn(private val onEvent: (AssistEvent) -> Unit) {
+        var runEnded = false
+        var continued = false
+        var playbackJob: Job? = null
+        private var finished = false
+
+        fun finish() {
+            if (finished) return
+            finished = true
+            onEvent(AssistEvent.TurnFinished)
+        }
+    }
+
     /**
      * @param text input to run an intent pipeline with, or `null` to run a STT pipeline (check if
      * STT is supported _before_ calling this function)
@@ -144,6 +181,7 @@ abstract class AssistViewModelBase(
         onEvent: (AssistEvent) -> Unit,
     ): Job {
         val isVoice = text == null
+        val turn = RunTurn(onEvent)
         return viewModelScope.launch {
             val flow = try {
                 if (isVoice) {
@@ -174,6 +212,7 @@ abstract class AssistViewModelBase(
                         handleRunStart(
                             event.data as? AssistPipelineRunStart,
                             isVoice,
+                            turn,
                             onEvent,
                         )
                         onEvent(AssistEvent.PipelineStarted)
@@ -194,6 +233,7 @@ abstract class AssistViewModelBase(
                     AssistPipelineEventType.TTS_END -> handleTtsEnd(
                         event.data as? AssistPipelineTtsEnd,
                         isVoice,
+                        turn,
                         onEvent,
                     )
 
@@ -201,9 +241,10 @@ abstract class AssistViewModelBase(
                         stopRecording()
                         cancel()
                         onEvent(AssistEvent.PipelineEnded)
+                        handleRunEnd(turn)
                     }
 
-                    AssistPipelineEventType.ERROR -> if (handleError(event.data as? AssistPipelineError, onEvent)) {
+                    AssistPipelineEventType.ERROR -> if (handleError(event.data as? AssistPipelineError, turn, onEvent)) {
                         cancel()
                     }
 
@@ -213,11 +254,17 @@ abstract class AssistViewModelBase(
                 }
             } ?: run {
                 onEvent(AssistEvent.Message.Output(app.getString(R.string.assist_error)))
+                turn.finish()
             }
         }
     }
 
-    private fun handleRunStart(data: AssistPipelineRunStart?, isVoice: Boolean, onEvent: (AssistEvent) -> Unit) {
+    private fun handleRunStart(
+        data: AssistPipelineRunStart?,
+        isVoice: Boolean,
+        turn: RunTurn,
+        onEvent: (AssistEvent) -> Unit,
+    ) {
         if (!isVoice) return
 
         data?.ttsOutput?.let { ttsOutput ->
@@ -226,23 +273,7 @@ abstract class AssistViewModelBase(
             if (audioPath.isNotBlank() && shouldPlay) {
                 currentPathBeingPlayed = audioPath
                 stopPlayback()
-                currentPlayAudioJob = viewModelScope.launch {
-                    try {
-                        playAudio(audioPath).collect { state ->
-                            when (state) {
-                                PlaybackState.PLAYING -> isPlayingAudio = true
-                                PlaybackState.STOP_PLAYING -> {
-                                    isPlayingAudio = false
-                                    onEvent(AssistEvent.PlaybackFinished)
-                                    notifyContinueConversationIfNeeded(onEvent)
-                                }
-                                PlaybackState.READY -> { /* No op */ }
-                            }
-                        }
-                    } finally {
-                        isPlayingAudio = false
-                    }
-                }
+                launchPlayback(audioPath, markPlayingOnStart = false, turn, onEvent)
             }
         }
 
@@ -282,28 +313,71 @@ abstract class AssistViewModelBase(
      * streaming TTS in RUN_START. If [currentPathBeingPlayed] is set, audio is already
      * playing from RUN_START and this handler is skipped.
      */
-    private fun handleTtsEnd(data: AssistPipelineTtsEnd?, isVoice: Boolean, onEvent: (AssistEvent) -> Unit) {
+    private fun handleTtsEnd(
+        data: AssistPipelineTtsEnd?,
+        isVoice: Boolean,
+        turn: RunTurn,
+        onEvent: (AssistEvent) -> Unit,
+    ) {
         if (!isVoice || currentPathBeingPlayed != null) return
 
-        currentPlayAudioJob = viewModelScope.launch {
-            val audioPath = data?.ttsOutput?.url
-            if (!audioPath.isNullOrBlank()) {
-                isPlayingAudio = true
-                try {
-                    playAudio(audioPath).first { state -> state == PlaybackState.STOP_PLAYING }
-                } finally {
-                    isPlayingAudio = false
+        val audioPath = data?.ttsOutput?.url
+        if (audioPath.isNullOrBlank()) {
+            onPlaybackDone(turn, onEvent)
+        } else {
+            launchPlayback(audioPath, markPlayingOnStart = true, turn, onEvent)
+        }
+    }
+
+    private fun handleRunEnd(turn: RunTurn) {
+        turn.runEnded = true
+        val playbackPending = turn.playbackJob?.isActive == true
+        if (!playbackPending && !turn.continued && !continueConversation.get()) {
+            turn.finish()
+        }
+    }
+
+    /**
+     * Plays the TTS answer at [audioPath]. Once the playback completes (without being cancelled),
+     * emits [AssistEvent.PlaybackFinished] and either continues the conversation or finishes the turn.
+     *
+     * @param markPlayingOnStart whether [isPlayingAudio] is set before the player reports it plays
+     */
+    private fun launchPlayback(
+        audioPath: String,
+        markPlayingOnStart: Boolean,
+        turn: RunTurn,
+        onEvent: (AssistEvent) -> Unit,
+    ) {
+        val usage = ttsPlaybackUsage
+        val playbackJob = viewModelScope.launch {
+            if (markPlayingOnStart) isPlayingAudio = true
+            try {
+                playAudio(audioPath, usage).collect { state ->
+                    if (state == PlaybackState.PLAYING) isPlayingAudio = true
                 }
-                onEvent(AssistEvent.PlaybackFinished)
+            } finally {
+                isPlayingAudio = false
             }
-            notifyContinueConversationIfNeeded(onEvent)
+            onEvent(AssistEvent.PlaybackFinished)
+            onPlaybackDone(turn, onEvent)
+        }
+        currentPlayAudioJob = playbackJob
+        turn.playbackJob = playbackJob
+    }
+
+    private fun onPlaybackDone(turn: RunTurn, onEvent: (AssistEvent) -> Unit) {
+        if (notifyContinueConversationIfNeeded(onEvent)) {
+            turn.continued = true
+        } else if (turn.runEnded) {
+            turn.finish()
         }
     }
 
     /**
      * Return true if we need to cancel the job
      */
-    private fun handleError(data: AssistPipelineError?, onEvent: (AssistEvent) -> Unit): Boolean {
+    private fun handleError(data: AssistPipelineError?, turn: RunTurn, onEvent: (AssistEvent) -> Unit): Boolean {
         if (data?.isDuplicatedWakeWord == true) {
             Timber.d("Duplicate wake-up detected, dismissing Assist")
             onEvent(AssistEvent.Dismiss)
@@ -313,6 +387,7 @@ abstract class AssistViewModelBase(
         val errorMessage = data?.message ?: return false
         onEvent(AssistEvent.Message.Error(errorMessage))
         stopRecording()
+        turn.finish()
         return true
     }
 
@@ -335,6 +410,7 @@ abstract class AssistViewModelBase(
             val audioChannel = Channel<ByteArray>(Channel.UNLIMITED)
 
             producerJob = launch {
+                awaitInputRoute()
                 audioStrategy.audioData().catch {
                     Timber.e(it, "Error collecting audio data")
                     onError(it)
@@ -368,17 +444,27 @@ abstract class AssistViewModelBase(
         }
     }
 
+    /**
+     * Plays the audio at [path] on the server. The returned flow completes after the first
+     * [PlaybackState.STOP_PLAYING], which is also emitted when the player ends without reporting it
+     * (muted stream, player error) or when there is no URL to play from.
+     */
     @OptIn(ExperimentalCoroutinesApi::class)
-    private suspend fun playAudio(path: String): Flow<PlaybackState> {
+    private suspend fun playAudio(path: String, usage: AudioUsage): Flow<PlaybackState> {
         return serverManager.connectionStateProvider(selectedServerId).urlFlow().flatMapLatest { urlState ->
             val baseUrl = if (urlState is UrlState.HasUrl) {
                 urlState.url
             } else {
                 null
             }
-            UrlUtil.handle(baseUrl, path)?.let {
-                audioUrlPlayer.playAudio(it.toString())
-            } ?: emptyFlow()
+            UrlUtil.handle(baseUrl, path)?.let { url ->
+                audioUrlPlayer.playAudio(url.toString(), usage).onCompletion { cause ->
+                    if (cause == null) emit(PlaybackState.STOP_PLAYING)
+                }
+            } ?: flowOf(PlaybackState.STOP_PLAYING)
+        }.transformWhile { state ->
+            emit(state)
+            state != PlaybackState.STOP_PLAYING
         }
     }
 
@@ -437,12 +523,15 @@ abstract class AssistViewModelBase(
 
     /**
      * Checks if the conversation should continue and notifies the UI if so.
+     * Returns whether [AssistEvent.ContinueConversation] was emitted.
      * This is called after audio playback finishes to let the player complete before
      * recording a new entry from the user.
      */
-    private fun notifyContinueConversationIfNeeded(onEvent: (AssistEvent) -> Unit) {
+    private fun notifyContinueConversationIfNeeded(onEvent: (AssistEvent) -> Unit): Boolean {
         if (continueConversation.getAndSet(false)) {
             onEvent(AssistEvent.ContinueConversation)
+            return true
         }
+        return false
     }
 }
