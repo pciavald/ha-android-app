@@ -623,13 +623,14 @@ class AssistViewModelBaseTest {
         viewModel.setupRecorder()
         viewModel.runVoicePipeline()
         advanceUntilIdle()
+        val start = currentTime
 
         pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
         pipelineEventsFlow.emit(createRunEndEvent())
         runCurrent()
 
         assertEquals(AssistEvent.TurnFinished, viewModel.receivedEvents.last())
-        assertEquals(0L, currentTime)
+        assertEquals(start, currentTime)
     }
 
     @Test
