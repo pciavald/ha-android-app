@@ -113,6 +113,8 @@ class AssistActivity : BaseActivity() {
                     null
                 },
                 wakeWordPhrase = intent.getStringExtra(EXTRA_FROM_WAKE_WORD_PHRASE),
+                // A voice command comes from a Bluetooth headset asking for the assistant
+                fromHeadset = intent.action == Intent.ACTION_VOICE_COMMAND,
             )
         }
 

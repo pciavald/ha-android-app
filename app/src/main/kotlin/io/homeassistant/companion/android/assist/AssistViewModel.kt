@@ -13,6 +13,7 @@ import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.homeassistant.companion.android.assist.bluetooth.HeadsetVoiceSession
 import io.homeassistant.companion.android.assist.ui.AssistMessage
 import io.homeassistant.companion.android.assist.ui.AssistUiPipeline
 import io.homeassistant.companion.android.common.R as commonR
@@ -22,6 +23,7 @@ import io.homeassistant.companion.android.common.assist.AssistViewModelBase
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineResponse
 import io.homeassistant.companion.android.common.util.AudioUrlPlayer
+import io.homeassistant.companion.android.common.util.AudioUsage
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -32,12 +34,17 @@ import timber.log.Timber
 @VisibleForTesting
 internal val CLOSE_INACTIVE = 30.seconds
 
+/** Longest a Bluetooth headset turn may keep the headset audio link open. */
+@VisibleForTesting
+internal val HEADSET_SESSION_TIMEOUT = 45.seconds
+
 @HiltViewModel(assistedFactory = AssistViewModel.Factory::class)
 class AssistViewModel @AssistedInject constructor(
     serverManager: ServerManager,
     @Assisted initialAudioStrategy: AssistAudioStrategy,
     audioUrlPlayer: AudioUrlPlayer,
     application: Application,
+    private val headsetSession: HeadsetVoiceSession,
 ) : AssistViewModelBase(serverManager, initialAudioStrategy, audioUrlPlayer, application) {
 
     @AssistedFactory
@@ -52,6 +59,12 @@ class AssistViewModel @AssistedInject constructor(
                     wakeWordPhrase = detectedPhrase
                     onMicrophoneInput()
                 }
+            }
+        }
+        viewModelScope.launch {
+            headsetSession.endedByHeadset.collect {
+                Timber.d("Headset ended the voice session")
+                endHeadsetSession()
             }
         }
     }
@@ -98,6 +111,14 @@ class AssistViewModel @AssistedInject constructor(
 
     private var startedFromWakeWord = false
     private var inactivityTimerJob: Job? = null
+    private var headsetTimeoutJob: Job? = null
+
+    override val ttsPlaybackUsage: AudioUsage
+        get() = if (headsetSession.isActive) AudioUsage.VOICE_COMMUNICATION else AudioUsage.ASSISTANT
+
+    override suspend fun awaitInputRoute() {
+        if (headsetSession.isActive) headsetSession.awaitAudioRoute()
+    }
 
     fun onCreate(
         hasPermission: Boolean,
@@ -105,8 +126,11 @@ class AssistViewModel @AssistedInject constructor(
         pipelineId: String?,
         startListening: Boolean?,
         wakeWordPhrase: String?,
+        fromHeadset: Boolean = false,
     ) {
         viewModelScope.launch {
+            // The headset only waits a few seconds for the assistant to accept its request
+            if (fromHeadset) startHeadsetSession()
             this@AssistViewModel.hasPermission = hasPermission
             this@AssistViewModel.wakeWordPhrase = wakeWordPhrase
             this@AssistViewModel.startedFromWakeWord = wakeWordPhrase != null
@@ -186,6 +210,17 @@ class AssistViewModel @AssistedInject constructor(
      * @param lockedMatches whether the locked state changed and contents should be cleared
      */
     fun onNewIntent(intent: Intent, lockedMatches: Boolean) {
+        if (intent.action == Intent.ACTION_VOICE_COMMAND && !headsetSession.isActive) {
+            viewModelScope.launch {
+                startHeadsetSession()
+                refreshForNewIntent(intent, lockedMatches)
+            }
+        } else {
+            refreshForNewIntent(intent, lockedMatches)
+        }
+    }
+
+    private fun refreshForNewIntent(intent: Intent, lockedMatches: Boolean) {
         if (
             (intent.flags and Intent.FLAG_ACTIVITY_BROUGHT_TO_FRONT != 0) ||
             intent.action in
@@ -198,6 +233,47 @@ class AssistViewModel @AssistedInject constructor(
             if (inputMode == AssistInputMode.VOICE_ACTIVE || inputMode == AssistInputMode.VOICE_INACTIVE) {
                 onMicrophoneInput()
             }
+        }
+    }
+
+    /**
+     * Accepts the voice recognition request of a Bluetooth headset, so that the turn is heard and
+     * answered through it. Without a headset session Assist keeps using the phone audio.
+     */
+    private suspend fun startHeadsetSession() {
+        if (headsetSession.start()) restartHeadsetTimeout()
+    }
+
+    private fun restartHeadsetTimeout() {
+        headsetTimeoutJob?.cancel()
+        headsetTimeoutJob = viewModelScope.launch {
+            delay(HEADSET_SESSION_TIMEOUT)
+            Timber.w("Headset voice session timed out")
+            endHeadsetSession()
+        }
+    }
+
+    private fun stopHeadsetSession() {
+        headsetTimeoutJob?.cancel()
+        headsetTimeoutJob = null
+        headsetSession.stop()
+    }
+
+    /** Drops the current turn and closes Assist, used when the headset session ends early. */
+    private fun endHeadsetSession() {
+        stopRecording(sendRecorded = false)
+        stopPlayback()
+        stopHeadsetSession()
+        shouldFinish = true
+    }
+
+    /** Releases the headset at the end of a turn and closes Assist if the turn came from it. */
+    private fun onTurnFinished() {
+        if (headsetSession.isActive) {
+            stopHeadsetSession()
+            shouldFinish = true
+        } else {
+            restartInactivityTimer()
         }
     }
 
@@ -300,6 +376,7 @@ class AssistViewModel @AssistedInject constructor(
 
         stopRecording(sendRecorded = false)
         stopPlayback()
+        stopHeadsetSession()
 
         selectedServerId = serverId
         setPipeline(id)
@@ -371,10 +448,12 @@ class AssistViewModel @AssistedInject constructor(
             }
 
             AssistInputMode.VOICE_INACTIVE -> {
+                stopHeadsetSession()
                 inputMode = AssistInputMode.TEXT
             }
 
             AssistInputMode.VOICE_ACTIVE -> {
+                stopHeadsetSession()
                 stopRecording(sendRecorded = false)
                 // Remove placeholder message if present from proactive recording
                 if (_conversation.lastOrNull()?.let { it.isPlaceholder && it.isInput } == true) {
@@ -481,11 +560,20 @@ class AssistViewModel @AssistedInject constructor(
 
                 is AssistEvent.PipelineEnded,
                 is AssistEvent.PlaybackFinished,
-                is AssistEvent.TurnFinished,
                 -> restartInactivityTimer()
 
-                is AssistEvent.ContinueConversation -> onMicrophoneInput()
-                is AssistEvent.Dismiss -> shouldFinish = true
+                is AssistEvent.TurnFinished -> onTurnFinished()
+
+                is AssistEvent.ContinueConversation -> {
+                    // The headset audio link stays open for the follow-up turn
+                    if (headsetSession.isActive) restartHeadsetTimeout()
+                    onMicrophoneInput()
+                }
+
+                is AssistEvent.Dismiss -> {
+                    stopHeadsetSession()
+                    shouldFinish = true
+                }
             }
             if (!shouldFinish && pendingWakeWordConfirmation) {
                 // Any event confirms this is not a duplicate wake-up, so the UI can be shown.
@@ -526,5 +614,6 @@ class AssistViewModel @AssistedInject constructor(
         inactivityTimerJob?.cancel()
         stopRecording()
         stopPlayback()
+        stopHeadsetSession()
     }
 }
