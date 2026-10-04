@@ -99,6 +99,14 @@ class AssistViewModel @AssistedInject constructor(
     private var startedFromWakeWord = false
     private var inactivityTimerJob: Job? = null
 
+    /**
+     * Voice pipeline run in progress. Identical runs share one server subscription, so a second
+     * run started meanwhile would receive the same events and show every message twice.
+     */
+    private var voiceRunJob: Job? = null
+    private val isVoiceRunActive: Boolean
+        get() = voiceRunJob?.isActive == true
+
     fun onCreate(
         hasPermission: Boolean,
         serverId: Int?,
@@ -195,7 +203,11 @@ class AssistViewModel @AssistedInject constructor(
                 _conversation.clear()
                 _conversation.add(startMessage)
             }
-            if (inputMode == AssistInputMode.VOICE_ACTIVE || inputMode == AssistInputMode.VOICE_INACTIVE) {
+            if (isVoiceRunActive || inputMode == AssistInputMode.VOICE_ACTIVE) {
+                // Headsets and watches send the trigger again when the answer takes a few seconds:
+                // it belongs to the current turn, which must neither be stopped nor started twice
+                Timber.d("Assist triggered again while a voice run is active, continuing the current run")
+            } else if (inputMode == AssistInputMode.VOICE_INACTIVE) {
                 onMicrophoneInput()
             }
         }
@@ -331,6 +343,8 @@ class AssistViewModel @AssistedInject constructor(
                 Timber.e(e, "Failed to set last used pipeline")
             }
 
+            // A run of the previous pipeline must not hold back the one starting below
+            voiceRunJob?.cancel()
             _conversation.clear()
             _conversation.add(startMessage)
             clearPipelineData()
@@ -403,6 +417,11 @@ class AssistViewModel @AssistedInject constructor(
             return
         }
 
+        if (proactive != true && isVoiceRunActive) {
+            Timber.d("A voice run is already active, not starting another one")
+            return
+        }
+
         stopPlayback()
 
         if (!recorderProactive) {
@@ -439,7 +458,7 @@ class AssistViewModel @AssistedInject constructor(
         // Capture and clear wake word phrase - it should only be sent once for the initial command
         val wakeWord = wakeWordPhrase.also { wakeWordPhrase = null }
 
-        runAssistPipelineInternal(
+        val job = runAssistPipelineInternal(
             text = text,
             pipeline = selectedPipeline,
             wakeWordPhrase = wakeWord,
@@ -486,7 +505,12 @@ class AssistViewModel @AssistedInject constructor(
                 is AssistEvent.PlaybackFinished,
                 -> restartInactivityTimer()
 
-                is AssistEvent.ContinueConversation -> onMicrophoneInput()
+                is AssistEvent.ContinueConversation -> {
+                    // The follow-up is a new turn, even if this run has not reported its end yet
+                    voiceRunJob?.cancel()
+                    onMicrophoneInput()
+                }
+
                 is AssistEvent.Dismiss -> shouldFinish = true
             }
             if (!shouldFinish && pendingWakeWordConfirmation) {
@@ -495,6 +519,7 @@ class AssistViewModel @AssistedInject constructor(
                 pendingWakeWordConfirmation = false
             }
         }
+        if (isVoice) voiceRunJob = job
     }
 
     fun setPermissionInfo(hasPermission: Boolean, callback: () -> Unit) {
