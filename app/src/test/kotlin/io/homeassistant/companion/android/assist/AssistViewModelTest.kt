@@ -3,7 +3,9 @@ package io.homeassistant.companion.android.assist
 import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
+import io.homeassistant.companion.android.assist.bluetooth.HeadsetVoiceSession
 import io.homeassistant.companion.android.common.assist.AssistAudioStrategy
+import io.homeassistant.companion.android.common.assist.AssistViewModelBase
 import io.homeassistant.companion.android.common.assist.AssistViewModelBase.AssistInputMode
 import io.homeassistant.companion.android.common.data.integration.IntegrationRepository
 import io.homeassistant.companion.android.common.data.servers.ServerConnectionStateProvider
@@ -11,6 +13,7 @@ import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.servers.UrlState
 import io.homeassistant.companion.android.common.data.websocket.WebSocketRepository
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistChatLogDelta
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineError
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEvent
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEventType
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineIntentEnd
@@ -25,6 +28,7 @@ import io.homeassistant.companion.android.common.data.websocket.impl.entities.Co
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.GetConfigResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.TtsOutputResponse
 import io.homeassistant.companion.android.common.util.AudioUrlPlayer
+import io.homeassistant.companion.android.common.util.AudioUsage
 import io.homeassistant.companion.android.common.util.PlaybackState
 import io.homeassistant.companion.android.testing.unit.MainDispatcherJUnit5Extension
 import io.mockk.coEvery
@@ -32,7 +36,9 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.unmockkAll
+import io.mockk.verify
 import java.net.URL
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
@@ -63,6 +69,10 @@ class AssistViewModelTest {
     private val webSocketRepository: WebSocketRepository = mockk(relaxed = true)
     private val integrationRepository: IntegrationRepository = mockk(relaxed = true)
 
+    /** Headset session and server calls in the order they happened. */
+    private val calls = mutableListOf<String>()
+    private val headsetSession = FakeHeadsetVoiceSession(calls)
+
     private lateinit var viewModel: AssistViewModel
 
     @BeforeEach
@@ -71,7 +81,10 @@ class AssistViewModelTest {
         every { application.packageManager } returns packageManager
         every { packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE) } returns true
 
-        coEvery { serverManager.isRegistered() } returns true
+        coEvery { serverManager.isRegistered() } answers {
+            calls += "isRegistered"
+            true
+        }
         coEvery { serverManager.webSocketRepository(any()) } returns webSocketRepository
         coEvery { serverManager.integrationRepository(any()) } returns integrationRepository
         coEvery { integrationRepository.isHomeAssistantVersionAtLeast(any(), any(), any()) } returns true
@@ -113,6 +126,7 @@ class AssistViewModelTest {
             serverManager = serverManager,
             audioUrlPlayer = audioUrlPlayer,
             application = application,
+            headsetSession = headsetSession,
             initialAudioStrategy = object : AssistAudioStrategy {
                 override suspend fun audioData(): Flow<ShortArray> = emptyFlow()
 
@@ -129,14 +143,19 @@ class AssistViewModelTest {
         )
     }
 
-    private fun createAndInitialize(hasPermission: Boolean = false, startedWithWakeWord: Boolean = false): AssistViewModel {
+    private fun createAndInitialize(
+        hasPermission: Boolean = false,
+        startedWithWakeWord: Boolean = false,
+        fromHeadset: Boolean = false,
+    ): AssistViewModel {
         val vm = createViewModel()
         vm.onCreate(
             hasPermission = hasPermission,
             serverId = null,
             pipelineId = null,
-            startListening = null,
+            startListening = if (fromHeadset) true else null,
             wakeWordPhrase = if (startedWithWakeWord) "Okay Nabu" else null,
+            fromHeadset = fromHeadset,
         )
         return vm
     }
@@ -146,72 +165,77 @@ class AssistViewModelTest {
         unmockkAll()
     }
 
+    private val pipelineEvents = MutableSharedFlow<AssistPipelineEvent>()
+
+    /**
+     * Sets up mocks for a voice pipeline backed by [pipelineEvents].
+     *
+     * Configures the audio recorder to start successfully and wires
+     * [pipelineEvents] as the pipeline event source for voice input.
+     */
+    private fun setupVoicePipeline() {
+        coEvery {
+            webSocketRepository.runAssistPipelineForVoice(any(), any(), anyNullable(), anyNullable(), anyNullable())
+        } returns pipelineEvents
+    }
+
+    /**
+     * Sets up mocks for a voice pipeline that supports TTS playback.
+     *
+     * Extends [setupVoicePipeline] with connection state and [AudioUrlPlayer]
+     * mocks so that emitting [AssistPipelineEventType.TTS_END] triggers audio
+     * playback through [playbackStates].
+     */
+    private fun setupVoicePipelineWithTts(playbackStates: MutableSharedFlow<PlaybackState>) {
+        setupVoicePipeline()
+
+        val connectionStateProvider = mockk<ServerConnectionStateProvider>()
+        coEvery { serverManager.connectionStateProvider(any()) } returns connectionStateProvider
+        every { connectionStateProvider.urlFlow(anyNullable()) } returns flowOf(
+            UrlState.HasUrl(URL("http://test-ha.local")),
+        )
+        every { audioUrlPlayer.playAudio(any(), any()) } returns playbackStates
+    }
+
+    private suspend fun emitIntentEnd(continueConversation: Boolean = false) {
+        pipelineEvents.emit(
+            AssistPipelineEvent(
+                type = AssistPipelineEventType.INTENT_END,
+                data = AssistPipelineIntentEnd(
+                    intentOutput = ConversationResponse(
+                        response = ConversationSpeechResponse(
+                            speech = ConversationSpeechPlainResponse(
+                                plain = mapOf("speech" to "Hello there"),
+                            ),
+                        ),
+                        conversationId = "test-conv",
+                        continueConversation = continueConversation,
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private suspend fun emitTtsEnd() {
+        pipelineEvents.emit(
+            AssistPipelineEvent(
+                type = AssistPipelineEventType.TTS_END,
+                data = AssistPipelineTtsEnd(
+                    ttsOutput = TtsOutputResponse(
+                        mimeType = "audio/mpeg",
+                        url = "/api/tts_proxy/test.mp3",
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private suspend fun emitRunEnd() {
+        pipelineEvents.emit(AssistPipelineEvent(type = AssistPipelineEventType.RUN_END, data = null))
+    }
+
     @Nested
     inner class InactivityTimerTest {
-
-        private val pipelineEvents = MutableSharedFlow<AssistPipelineEvent>()
-
-        /**
-         * Sets up mocks for a voice pipeline backed by [pipelineEvents].
-         *
-         * Configures the audio recorder to start successfully and wires
-         * [pipelineEvents] as the pipeline event source for voice input.
-         */
-        private fun setupVoicePipeline() {
-            coEvery {
-                webSocketRepository.runAssistPipelineForVoice(any(), any(), anyNullable(), anyNullable(), anyNullable())
-            } returns pipelineEvents
-        }
-
-        /**
-         * Sets up mocks for a voice pipeline that supports TTS playback.
-         *
-         * Extends [setupVoicePipeline] with connection state and [AudioUrlPlayer]
-         * mocks so that emitting [AssistPipelineEventType.TTS_END] triggers audio
-         * playback through [playbackStates].
-         */
-        private fun setupVoicePipelineWithTts(playbackStates: MutableSharedFlow<PlaybackState>) {
-            setupVoicePipeline()
-
-            val connectionStateProvider = mockk<ServerConnectionStateProvider>()
-            coEvery { serverManager.connectionStateProvider(any()) } returns connectionStateProvider
-            every { connectionStateProvider.urlFlow(anyNullable()) } returns flowOf(
-                UrlState.HasUrl(URL("http://test-ha.local")),
-            )
-            every { audioUrlPlayer.playAudio(any(), any()) } returns playbackStates
-        }
-
-        private suspend fun emitIntentEnd() {
-            pipelineEvents.emit(
-                AssistPipelineEvent(
-                    type = AssistPipelineEventType.INTENT_END,
-                    data = AssistPipelineIntentEnd(
-                        intentOutput = ConversationResponse(
-                            response = ConversationSpeechResponse(
-                                speech = ConversationSpeechPlainResponse(
-                                    plain = mapOf("speech" to "Hello there"),
-                                ),
-                            ),
-                            conversationId = "test-conv",
-                        ),
-                    ),
-                ),
-            )
-        }
-
-        private suspend fun emitTtsEnd() {
-            pipelineEvents.emit(
-                AssistPipelineEvent(
-                    type = AssistPipelineEventType.TTS_END,
-                    data = AssistPipelineTtsEnd(
-                        ttsOutput = TtsOutputResponse(
-                            mimeType = "audio/mpeg",
-                            url = "/api/tts_proxy/test.mp3",
-                        ),
-                    ),
-                ),
-            )
-        }
 
         @Test
         fun `Given started with wake word and voice inactive mode and non-placeholder message when CLOSE_INACTIVE elapses then shouldFinish is true`() = runTest {
@@ -703,6 +727,199 @@ class AssistViewModelTest {
                 listOf(GREETING to false, "Turn on the lights" to true, "Turned on the lights" to false),
                 viewModel.messages(),
             )
+        }
+    }
+
+    @Nested
+    inner class HeadsetSessionTest {
+
+        @Test
+        fun `Given voice command from a headset when onCreate then the headset session starts before any server call`() = runTest {
+            setupVoicePipeline()
+
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            assertEquals("start", calls.first())
+            assertTrue("isRegistered" in calls)
+            assertTrue(headsetSession.isActive)
+        }
+
+        @Test
+        fun `Given launch not from a headset when onCreate then no headset session is started`() = runTest {
+            viewModel = createAndInitialize()
+            runCurrent()
+
+            assertFalse("start" in calls)
+        }
+
+        @Test
+        fun `Given active headset session when recording starts then the headset audio route is awaited`() = runTest {
+            setupVoicePipeline()
+
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            assertTrue("awaitAudioRoute" in calls)
+        }
+
+        @Test
+        fun `Given active headset session when the turn finishes then the session stops and Assist closes`() = runTest {
+            setupVoicePipeline()
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            emitRunEnd()
+            runCurrent()
+
+            assertEquals(1, headsetSession.stopCount)
+            assertFalse(headsetSession.isActive)
+            assertTrue(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given headset session failed to start when the turn finishes then Assist stays open`() = runTest {
+            setupVoicePipeline()
+            headsetSession.startResult = false
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            emitRunEnd()
+            runCurrent()
+
+            assertFalse(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given active headset session when the pipeline asks to dismiss then the session stops`() = runTest {
+            setupVoicePipeline()
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            pipelineEvents.emit(
+                AssistPipelineEvent(
+                    type = AssistPipelineEventType.ERROR,
+                    data = AssistPipelineError(code = "duplicate_wake_up_detected"),
+                ),
+            )
+            runCurrent()
+
+            assertEquals(1, headsetSession.stopCount)
+            assertTrue(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given active headset session when onDestroy then the session stops`() = runTest {
+            setupVoicePipeline()
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            viewModel.onDestroy()
+
+            assertEquals(1, headsetSession.stopCount)
+        }
+
+        @Test
+        fun `Given active headset session when the conversation continues then the session stays active`() = runTest {
+            val playbackStates = MutableSharedFlow<PlaybackState>()
+            setupVoicePipelineWithTts(playbackStates)
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            emitIntentEnd(continueConversation = true)
+            emitTtsEnd()
+            runCurrent()
+            emitRunEnd()
+            runCurrent()
+            playbackStates.emit(PlaybackState.STOP_PLAYING)
+            runCurrent()
+
+            assertEquals(0, headsetSession.stopCount)
+            assertTrue(headsetSession.isActive)
+            assertFalse(viewModel.shouldFinish)
+            assertEquals(AssistViewModelBase.AssistInputMode.VOICE_ACTIVE, viewModel.inputMode)
+        }
+
+        @Test
+        fun `Given active headset session when the headset ends it then Assist closes`() = runTest {
+            setupVoicePipeline()
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            headsetSession.ended.emit(Unit)
+            runCurrent()
+
+            assertEquals(1, headsetSession.stopCount)
+            assertTrue(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given active headset session when nothing ends the turn then the session times out`() = runTest {
+            setupVoicePipeline()
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            advanceTimeBy(HEADSET_SESSION_TIMEOUT - 1.seconds)
+            runCurrent()
+            assertFalse(viewModel.shouldFinish)
+
+            advanceTimeBy(1.seconds)
+            runCurrent()
+            assertEquals(1, headsetSession.stopCount)
+            assertTrue(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given active headset session when TTS plays then it uses the voice communication usage`() = runTest {
+            setupVoicePipelineWithTts(MutableSharedFlow())
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            emitTtsEnd()
+            runCurrent()
+
+            verify { audioUrlPlayer.playAudio(any(), AudioUsage.VOICE_COMMUNICATION) }
+        }
+
+        @Test
+        fun `Given no headset session when TTS plays then it uses the assistant usage`() = runTest {
+            setupVoicePipelineWithTts(MutableSharedFlow())
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+
+            emitTtsEnd()
+            runCurrent()
+
+            verify { audioUrlPlayer.playAudio(any(), AudioUsage.ASSISTANT) }
+        }
+    }
+
+    private class FakeHeadsetVoiceSession(private val calls: MutableList<String>) : HeadsetVoiceSession {
+        var startResult = true
+        var stopCount = 0
+        val ended = MutableSharedFlow<Unit>()
+
+        private var active = false
+
+        override val isActive: Boolean
+            get() = active
+
+        override val endedByHeadset: Flow<Unit> = ended
+
+        override suspend fun start(): Boolean {
+            calls += "start"
+            active = startResult
+            return startResult
+        }
+
+        override suspend fun awaitAudioRoute(timeout: Duration): Boolean {
+            calls += "awaitAudioRoute"
+            return true
+        }
+
+        override fun stop() {
+            if (active) stopCount++
+            active = false
         }
     }
 }
