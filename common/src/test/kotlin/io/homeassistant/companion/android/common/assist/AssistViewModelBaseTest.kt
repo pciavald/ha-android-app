@@ -2,14 +2,25 @@ package io.homeassistant.companion.android.common.assist
 
 import android.app.Application
 import android.content.pm.PackageManager
+import io.homeassistant.companion.android.common.data.servers.ServerConnectionStateProvider
 import io.homeassistant.companion.android.common.data.servers.ServerManager
+import io.homeassistant.companion.android.common.data.servers.UrlState
 import io.homeassistant.companion.android.common.data.websocket.WebSocketRepository
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineError
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEvent
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEventType
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineIntentEnd
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineRunStart
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineTtsEnd
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.ConversationResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.ConversationSpeechPlainResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.ConversationSpeechResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.StreamTtsOutputResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.TtsOutputResponse
 import io.homeassistant.companion.android.common.util.AudioUrlPlayer
+import io.homeassistant.companion.android.common.util.AudioUsage
+import io.homeassistant.companion.android.common.util.PlaybackState
 import io.homeassistant.companion.android.common.util.VoiceAudioRecorder
 import io.homeassistant.companion.android.common.util.toAudioBytes
 import io.homeassistant.companion.android.testing.unit.MainDispatcherJUnit5Extension
@@ -19,14 +30,19 @@ import io.mockk.coVerifyOrder
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.unmockkAll
+import io.mockk.verify
+import java.net.URL
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -405,6 +421,167 @@ class AssistViewModelBaseTest {
         assertEquals("WebSocket disconnected", viewModel.receivedErrors.first().message)
     }
 
+    @Test
+    fun `Given voice pipeline without TTS When RUN_END received Then TurnFinished is emitted once after PipelineEnded`() = runTest {
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42))
+        pipelineEventsFlow.emit(createRunEndEvent())
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(AssistEvent.PipelineStarted, AssistEvent.PipelineEnded, AssistEvent.TurnFinished),
+            viewModel.receivedEvents,
+        )
+    }
+
+    @Test
+    fun `Given streamed TTS still playing When RUN_END received Then TurnFinished is emitted only after STOP_PLAYING`() = runTest {
+        val playbackStates = MutableSharedFlow<PlaybackState>()
+        setupPlayback(playbackStates)
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
+        advanceUntilIdle()
+        playbackStates.emit(PlaybackState.PLAYING)
+        pipelineEventsFlow.emit(createRunEndEvent())
+        advanceUntilIdle()
+
+        assertFalse(AssistEvent.TurnFinished in viewModel.receivedEvents)
+
+        playbackStates.emit(PlaybackState.STOP_PLAYING)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                AssistEvent.PipelineStarted,
+                AssistEvent.PipelineEnded,
+                AssistEvent.PlaybackFinished,
+                AssistEvent.TurnFinished,
+            ),
+            viewModel.receivedEvents,
+        )
+    }
+
+    @Test
+    fun `Given continue conversation When playback finishes after RUN_END Then ContinueConversation is emitted without TurnFinished`() = runTest {
+        val playbackStates = MutableSharedFlow<PlaybackState>()
+        setupPlayback(playbackStates)
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42))
+        pipelineEventsFlow.emit(createIntentEndEvent(continueConversation = true))
+        pipelineEventsFlow.emit(createTtsEndEvent())
+        advanceUntilIdle()
+        pipelineEventsFlow.emit(createRunEndEvent())
+        advanceUntilIdle()
+        playbackStates.emit(PlaybackState.STOP_PLAYING)
+        advanceUntilIdle()
+
+        assertTrue(AssistEvent.ContinueConversation in viewModel.receivedEvents)
+        assertFalse(AssistEvent.TurnFinished in viewModel.receivedEvents)
+    }
+
+    @Test
+    fun `Given voice pipeline When error with message received Then TurnFinished is emitted after the error`() = runTest {
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createErrorEvent(code = "stt-no-text-recognized", message = "No text recognized"))
+        advanceUntilIdle()
+
+        assertEquals(2, viewModel.receivedEvents.size)
+        assertTrue(viewModel.receivedEvents[0] is AssistEvent.Message.Error)
+        assertEquals(AssistEvent.TurnFinished, viewModel.receivedEvents[1])
+    }
+
+    @Test
+    fun `Given pipeline fails to start When running the pipeline Then TurnFinished is emitted`() = runTest {
+        coEvery {
+            webSocketRepository.runAssistPipelineForVoice(any(), any(), any(), any(), any())
+        } throws IllegalStateException("Not connected")
+
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        assertEquals(AssistEvent.TurnFinished, viewModel.receivedEvents.last())
+    }
+
+    @Test
+    fun `Given player completes without STOP_PLAYING When TTS_END received Then PlaybackFinished and TurnFinished are emitted`() = runTest {
+        setupPlayback(emptyFlow())
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42))
+        pipelineEventsFlow.emit(createTtsEndEvent())
+        advanceUntilIdle()
+        pipelineEventsFlow.emit(createRunEndEvent())
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                AssistEvent.PipelineStarted,
+                AssistEvent.PlaybackFinished,
+                AssistEvent.PipelineEnded,
+                AssistEvent.TurnFinished,
+            ),
+            viewModel.receivedEvents,
+        )
+    }
+
+    @Test
+    fun `Given input route not ready When recorder is set up Then audio is collected only once the route is ready`() = runTest {
+        val inputRoute = CompletableDeferred<Unit>()
+        val routedViewModel = TestAssistViewModel(
+            serverManager = serverManager,
+            audioStrategy = DefaultAssistAudioStrategy(voiceAudioRecorder),
+            audioUrlPlayer = audioUrlPlayer,
+            application = application,
+            inputRoute = inputRoute,
+        )
+
+        routedViewModel.setupRecorder()
+        advanceUntilIdle()
+
+        coVerify(exactly = 0) { voiceAudioRecorder.audioData() }
+
+        inputRoute.complete(Unit)
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { voiceAudioRecorder.audioData() }
+    }
+
+    @Test
+    fun `Given TTS playback usage overridden When TTS is played Then the usage is passed to the player`() = runTest {
+        setupPlayback(flowOf(PlaybackState.PLAYING, PlaybackState.STOP_PLAYING))
+        viewModel.playbackUsage = AudioUsage.VOICE_COMMUNICATION
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
+        advanceUntilIdle()
+
+        verify { audioUrlPlayer.playAudio(any(), AudioUsage.VOICE_COMMUNICATION) }
+    }
+
+    private fun setupPlayback(playbackStates: Flow<PlaybackState>) {
+        val connectionStateProvider = mockk<ServerConnectionStateProvider>()
+        coEvery { serverManager.connectionStateProvider(any()) } returns connectionStateProvider
+        every { connectionStateProvider.urlFlow(anyNullable()) } returns flowOf(UrlState.HasUrl(URL("http://ha.local")))
+        every { audioUrlPlayer.playAudio(any(), any()) } returns playbackStates
+    }
+
     private fun createRunStartEvent(handlerId: Int): AssistPipelineEvent {
         return AssistPipelineEvent(
             type = AssistPipelineEventType.RUN_START,
@@ -413,6 +590,49 @@ class AssistViewModelBaseTest {
                 language = "en",
                 runnerData = mapOf("stt_binary_handler_id" to handlerId),
             ),
+        )
+    }
+
+    private fun createRunStartEvent(handlerId: Int, ttsUrl: String): AssistPipelineEvent {
+        return AssistPipelineEvent(
+            type = AssistPipelineEventType.RUN_START,
+            data = AssistPipelineRunStart(
+                pipeline = "test-pipeline",
+                language = "en",
+                runnerData = mapOf("stt_binary_handler_id" to handlerId),
+                ttsOutput = StreamTtsOutputResponse(mimeType = "audio/mpeg", url = ttsUrl, streamResponse = true),
+            ),
+        )
+    }
+
+    private fun createIntentEndEvent(continueConversation: Boolean): AssistPipelineEvent {
+        return AssistPipelineEvent(
+            type = AssistPipelineEventType.INTENT_END,
+            data = AssistPipelineIntentEnd(
+                intentOutput = ConversationResponse(
+                    response = ConversationSpeechResponse(
+                        speech = ConversationSpeechPlainResponse(plain = mapOf("speech" to "Which room?")),
+                    ),
+                    conversationId = "conversation",
+                    continueConversation = continueConversation,
+                ),
+            ),
+        )
+    }
+
+    private fun createTtsEndEvent(): AssistPipelineEvent {
+        return AssistPipelineEvent(
+            type = AssistPipelineEventType.TTS_END,
+            data = AssistPipelineTtsEnd(
+                ttsOutput = TtsOutputResponse(mimeType = "audio/mpeg", url = "/api/tts_proxy/answer.mp3"),
+            ),
+        )
+    }
+
+    private fun createRunEndEvent(): AssistPipelineEvent {
+        return AssistPipelineEvent(
+            type = AssistPipelineEventType.RUN_END,
+            data = null,
         )
     }
 
@@ -438,9 +658,19 @@ class AssistViewModelBaseTest {
         audioStrategy: AssistAudioStrategy,
         audioUrlPlayer: AudioUrlPlayer,
         application: Application,
+        private val inputRoute: CompletableDeferred<Unit>? = null,
     ) : AssistViewModelBase(serverManager, audioStrategy, audioUrlPlayer, application) {
 
         private var inputMode: AssistInputMode? = null
+
+        var playbackUsage = AudioUsage.ASSISTANT
+
+        override val ttsPlaybackUsage: AudioUsage
+            get() = playbackUsage
+
+        override suspend fun awaitInputRoute() {
+            inputRoute?.await()
+        }
 
         override fun getInput(): AssistInputMode? = inputMode
 

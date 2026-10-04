@@ -330,6 +330,7 @@ class ConversationViewModel @AssistedInject constructor(
                 }
                 is AssistEvent.PipelineStarted, is AssistEvent.PipelineEnded,
                 is AssistEvent.PlaybackFinished, is AssistEvent.Dismiss,
+                is AssistEvent.TurnFinished,
                 -> { /* No op on Wear */ }
                 is AssistEvent.ContinueConversation -> onMicrophoneInput()
             }

@@ -481,6 +481,7 @@ class AssistViewModel @AssistedInject constructor(
 
                 is AssistEvent.PipelineEnded,
                 is AssistEvent.PlaybackFinished,
+                is AssistEvent.TurnFinished,
                 -> restartInactivityTimer()
 
                 is AssistEvent.ContinueConversation -> onMicrophoneInput()
