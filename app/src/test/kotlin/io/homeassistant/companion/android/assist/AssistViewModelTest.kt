@@ -1,18 +1,23 @@
 package io.homeassistant.companion.android.assist
 
 import android.app.Application
+import android.content.Intent
 import android.content.pm.PackageManager
 import io.homeassistant.companion.android.common.assist.AssistAudioStrategy
+import io.homeassistant.companion.android.common.assist.AssistViewModelBase.AssistInputMode
 import io.homeassistant.companion.android.common.data.integration.IntegrationRepository
 import io.homeassistant.companion.android.common.data.servers.ServerConnectionStateProvider
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.servers.UrlState
 import io.homeassistant.companion.android.common.data.websocket.WebSocketRepository
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistChatLogDelta
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEvent
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEventType
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineIntentEnd
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineIntentProgress
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineListResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineSttEnd
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineTtsEnd
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.ConversationResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.ConversationSpeechPlainResponse
@@ -23,6 +28,7 @@ import io.homeassistant.companion.android.common.util.AudioUrlPlayer
 import io.homeassistant.companion.android.common.util.PlaybackState
 import io.homeassistant.companion.android.testing.unit.MainDispatcherJUnit5Extension
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.unmockkAll
@@ -39,6 +45,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -546,4 +553,158 @@ class AssistViewModelTest {
             assertFalse(viewModel.shouldFinish)
         }
     }
+
+    @Nested
+    inner class VoiceRunTest {
+
+        // A single flow for every run, as identical runs share one server subscription
+        private val pipelineEvents = MutableSharedFlow<AssistPipelineEvent>()
+
+        @BeforeEach
+        fun setUpVoicePipeline() {
+            every { application.getString(any<Int>()) } returns GREETING
+            coEvery {
+                webSocketRepository.runAssistPipelineForVoice(any(), any(), anyNullable(), anyNullable(), anyNullable())
+            } returns pipelineEvents
+        }
+
+        private fun voiceCommandIntent(): Intent = mockk {
+            every { flags } returns 0
+            every { action } returns Intent.ACTION_VOICE_COMMAND
+        }
+
+        private fun AssistViewModel.messages(): List<Pair<String, Boolean>> = conversation.map { it.message to it.isInput }
+
+        private fun verifyVoiceRuns(count: Int) {
+            coVerify(exactly = count) {
+                webSocketRepository.runAssistPipelineForVoice(any(), any(), anyNullable(), anyNullable(), anyNullable())
+            }
+        }
+
+        private suspend fun emitSttEnd(text: String) {
+            pipelineEvents.emit(
+                AssistPipelineEvent(
+                    type = AssistPipelineEventType.STT_END,
+                    data = AssistPipelineSttEnd(sttOutput = mapOf("text" to text)),
+                ),
+            )
+        }
+
+        private suspend fun emitIntentEnd(speech: String) {
+            pipelineEvents.emit(
+                AssistPipelineEvent(
+                    type = AssistPipelineEventType.INTENT_END,
+                    data = AssistPipelineIntentEnd(
+                        intentOutput = ConversationResponse(
+                            response = ConversationSpeechResponse(
+                                speech = ConversationSpeechPlainResponse(plain = mapOf("speech" to speech)),
+                            ),
+                            conversationId = "test-conv",
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        private suspend fun emitIntentProgress(delta: String) {
+            pipelineEvents.emit(
+                AssistPipelineEvent(
+                    type = AssistPipelineEventType.INTENT_PROGRESS,
+                    data = AssistPipelineIntentProgress(chatLogDelta = AssistChatLogDelta(content = delta)),
+                ),
+            )
+        }
+
+        private suspend fun emitRunEnd() {
+            pipelineEvents.emit(AssistPipelineEvent(type = AssistPipelineEventType.RUN_END, data = null))
+        }
+
+        @Test
+        fun `Given a voice run in progress when paused and triggered again then the run continues and each message is shown once`() = runTest {
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+
+            viewModel.onPause()
+            viewModel.onNewIntent(voiceCommandIntent(), lockedMatches = true)
+            runCurrent()
+
+            verifyVoiceRuns(1)
+
+            emitSttEnd("Turn on the lights")
+            emitIntentEnd("Turned on the lights")
+            runCurrent()
+
+            assertEquals(
+                listOf(GREETING to false, "Turn on the lights" to true, "Turned on the lights" to false),
+                viewModel.messages(),
+            )
+        }
+
+        @Test
+        fun `Given voice active mode when triggered again then recording continues and no run is started`() = runTest {
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+            assertEquals(AssistInputMode.VOICE_ACTIVE, viewModel.inputMode)
+
+            viewModel.onNewIntent(voiceCommandIntent(), lockedMatches = true)
+            runCurrent()
+
+            assertEquals(AssistInputMode.VOICE_ACTIVE, viewModel.inputMode)
+            verifyVoiceRuns(1)
+        }
+
+        @Test
+        fun `Given a voice run waiting for its answer when microphone is pressed then no run is started`() = runTest {
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+
+            viewModel.onMicrophoneInput() // Stops recording, the run waits for its answer
+            runCurrent()
+            viewModel.onMicrophoneInput()
+            runCurrent()
+
+            assertEquals(AssistInputMode.VOICE_INACTIVE, viewModel.inputMode)
+            verifyVoiceRuns(1)
+        }
+
+        @Test
+        fun `Given a streamed response when deltas arrive then they replace the placeholder of the response`() = runTest {
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+
+            emitSttEnd("Say hello")
+            emitIntentProgress("Hel")
+            emitIntentProgress("lo")
+            runCurrent()
+
+            assertEquals(
+                listOf(GREETING to false, "Say hello" to true, "Hello" to false),
+                viewModel.messages(),
+            )
+            assertFalse(viewModel.conversation.any { it.isPlaceholder })
+        }
+
+        @Test
+        fun `Given a voice run that ended when triggered again then a new run starts`() = runTest {
+            viewModel = createAndInitialize(hasPermission = true)
+            runCurrent()
+
+            emitSttEnd("Turn on the lights")
+            emitIntentEnd("Turned on the lights")
+            emitRunEnd()
+            runCurrent()
+
+            viewModel.onNewIntent(voiceCommandIntent(), lockedMatches = true)
+            runCurrent()
+
+            assertEquals(AssistInputMode.VOICE_ACTIVE, viewModel.inputMode)
+            verifyVoiceRuns(2)
+            assertEquals(
+                listOf(GREETING to false, "Turn on the lights" to true, "Turned on the lights" to false),
+                viewModel.messages(),
+            )
+        }
+    }
 }
+
+private const val GREETING = "How can I assist?"
