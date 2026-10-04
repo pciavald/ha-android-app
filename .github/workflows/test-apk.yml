@@ -1,0 +1,96 @@
+name: Test APK
+
+on: # yamllint disable-line rule:truthy
+  push:
+    branches:
+      - "fix/**"
+      - "feat/**"
+      - "ci/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  assist_tests:
+    name: Assist unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mock google-services.json
+        run: |
+          cp .github/mock-google-services.json app/google-services.json
+          cp .github/mock-google-services.json wear/google-services.json
+          cp .github/mock-google-services.json automotive/google-services.json
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          cache-provider: basic
+
+      - name: Run assist unit tests
+        run: >-
+          ./gradlew -PnoStrictMode
+          :common:testDebugUnitTest
+          --tests 'io.homeassistant.companion.android.common.assist.*'
+          --tests 'io.homeassistant.companion.android.common.util.*'
+          :app:testFullDebugUnitTest
+          --tests 'io.homeassistant.companion.android.assist.*'
+
+      - name: Upload test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: assist-test-reports
+          path: "**/build/reports/tests/"
+          retention-days: 7
+
+  apk:
+    name: Full debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mock google-services.json
+        run: cp .github/mock-google-services.json app/google-services.json
+
+      - name: Restore stable debug keystore
+        env:
+          KEYSTORE: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            mkdir -p ~/.android
+            echo "$KEYSTORE" | base64 --decode > ~/.android/debug.keystore
+          fi
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          cache-provider: basic
+
+      - name: Build full debug APK
+        run: ./gradlew :app:assembleFullDebug -PnoStrictMode -Pabis=arm64-v8a
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-full-debug
+          path: app/build/outputs/apk/full/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
