@@ -292,6 +292,7 @@ class ConversationViewModel @AssistedInject constructor(
         val haMessage = AssistMessage.placeholder(isInput = false)
         if (!isVoice) _conversation.add(haMessage)
         var message = if (isVoice) userMessage else haMessage
+        var hasResponseChunk = false
 
         runAssistPipelineInternal(
             text,
@@ -299,7 +300,11 @@ class ConversationViewModel @AssistedInject constructor(
         ) { event ->
             when (event) {
                 is AssistEvent.Message -> {
-                    _conversation.indexOf(message).takeIf { pos -> pos >= 0 }?.let { index ->
+                    // Once streamed, the response is kept as is: the final message only repeats it
+                    val isStreamedResponse = hasResponseChunk && message.id == haMessage.id
+                    _conversation.indexOfFirst { it.id == message.id }.takeIf { pos ->
+                        pos >= 0 && !isStreamedResponse
+                    }?.let { index ->
                         val isInput = event is AssistEvent.Message.Input
                         val isError = event is AssistEvent.Message.Error
                         _conversation[index] = message.copy(
@@ -317,15 +322,13 @@ class ConversationViewModel @AssistedInject constructor(
                     }
                 }
                 is AssistEvent.MessageChunk -> {
-                    val lastMessage = _conversation.last()
-                    if (lastMessage == haMessage) {
-                        // Remove '...' message and add the chunk received
-                        _conversation.removeAt(_conversation.lastIndex)
-                        _conversation.add(lastMessage.copy(message = event.chunk))
-                    } else {
-                        // Replace last message with the updated message with the new chunk append
-                        _conversation[_conversation.lastIndex] =
-                            lastMessage.copy(message = lastMessage.message + event.chunk)
+                    val index = _conversation.indexOfFirst { it.id == haMessage.id }
+                    if (index >= 0) {
+                        val current = _conversation[index]
+                        // The first chunk replaces the '…' placeholder, the next ones are appended
+                        val text = if (hasResponseChunk) current.message + event.chunk else event.chunk
+                        _conversation[index] = current.copy(message = text)
+                        hasResponseChunk = true
                     }
                 }
                 is AssistEvent.PipelineStarted, is AssistEvent.PipelineEnded,
