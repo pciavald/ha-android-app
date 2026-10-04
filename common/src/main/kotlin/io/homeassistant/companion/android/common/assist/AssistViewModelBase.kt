@@ -243,8 +243,8 @@ abstract class AssistViewModelBase(
                         handleRunEnd(turn)
                     }
 
-                    AssistPipelineEventType.ERROR -> if (handleError(event.data as? AssistPipelineError, turn, onEvent)) {
-                        job?.cancel()
+                    AssistPipelineEventType.ERROR -> {
+                        if (handleError(event.data as? AssistPipelineError, turn, onEvent)) job?.cancel()
                     }
 
                     else -> {
