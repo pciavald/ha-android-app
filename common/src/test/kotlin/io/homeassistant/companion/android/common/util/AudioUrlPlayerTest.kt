@@ -1,6 +1,7 @@
 package io.homeassistant.companion.android.common.util
 
 import android.media.AudioManager
+import androidx.media.AudioAttributesCompat
 import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import androidx.media3.common.AudioAttributes
@@ -154,7 +155,7 @@ class AudioUrlPlayerTest {
     }
 
     @Test
-    fun `Given isAssistant false when playAudio then uses media audio attributes`() = runTest {
+    fun `Given media usage when playAudio then uses media audio attributes`() = runTest {
         val listenerSlot = slot<Player.Listener>()
 
         every { audioManager.getStreamVolume(any()) } returns 1
@@ -164,7 +165,7 @@ class AudioUrlPlayerTest {
             listenerSlot.captured.onPlaybackStateChanged(Player.STATE_ENDED)
         }
 
-        player.playAudio("test_url", isAssistant = false).test {
+        player.playAudio("test_url", usage = AudioUsage.MEDIA).test {
             assertEquals(PlaybackState.READY, awaitItem())
             assertEquals(PlaybackState.PLAYING, awaitItem())
             assertEquals(PlaybackState.STOP_PLAYING, awaitItem())
@@ -182,6 +183,56 @@ class AudioUrlPlayerTest {
                 eq(false),
             )
         }
+    }
+
+    @Test
+    fun `Given voice communication usage when playAudio then uses voice communication attributes for player and focus`() = runTest {
+        val listenerSlot = slot<Player.Listener>()
+        val focusRequestSlot = slot<AudioFocusRequestCompat>()
+
+        mockkStatic(AudioManagerCompat::class)
+        every { AudioManagerCompat.requestAudioFocus(any(), capture(focusRequestSlot)) } returns AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        every { audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL) } returns 1
+        every { exoPlayer.addListener(capture(listenerSlot)) } just Runs
+        every { exoPlayer.prepare() } answers {
+            listenerSlot.captured.onPlaybackStateChanged(Player.STATE_READY)
+            listenerSlot.captured.onPlaybackStateChanged(Player.STATE_ENDED)
+        }
+
+        player.playAudio("test_url", usage = AudioUsage.VOICE_COMMUNICATION).test {
+            assertEquals(PlaybackState.READY, awaitItem())
+            assertEquals(PlaybackState.PLAYING, awaitItem())
+            assertEquals(PlaybackState.STOP_PLAYING, awaitItem())
+            expectNoEvents()
+        }
+
+        verify {
+            audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            exoPlayer.setAudioAttributes(
+                eq(
+                    AudioAttributes.Builder()
+                        .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                        .setUsage(C.USAGE_VOICE_COMMUNICATION)
+                        .build(),
+                ),
+                eq(false),
+            )
+        }
+        verify(exactly = 0) { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }
+        val focusAttributes = focusRequestSlot.captured.audioAttributesCompat
+        assertEquals(AudioAttributesCompat.USAGE_VOICE_COMMUNICATION, focusAttributes.usage)
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_SPEECH, focusAttributes.contentType)
+    }
+
+    @Test
+    fun `Given voice call volume equal to 0 when playAudio with voice communication usage then emits nothing`() = runTest {
+        every { audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL) } returns 0
+        every { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) } returns 1
+
+        val states = player.playAudio("test_url", usage = AudioUsage.VOICE_COMMUNICATION).toList()
+
+        assertTrue(states.isEmpty())
+        verify(exactly = 0) { exoPlayer.play() }
     }
 
     @Test
