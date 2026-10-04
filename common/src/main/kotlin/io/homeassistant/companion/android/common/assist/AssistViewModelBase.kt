@@ -25,11 +25,13 @@ import io.homeassistant.companion.android.common.util.VOICE_SAMPLE_RATE
 import io.homeassistant.companion.android.common.util.toAudioBytes
 import io.homeassistant.companion.android.util.UrlUtil
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flatMapLatest
@@ -140,6 +142,15 @@ abstract class AssistViewModelBase(
     /** Audio usage of the TTS playback, read when each playback starts. */
     protected open val ttsPlaybackUsage: AudioUsage
         get() = AudioUsage.ASSISTANT
+
+    /**
+     * How long the TTS answer is still considered playing after the player reports its end, read
+     * when each playback starts. The player ends once its last samples left the app, while the
+     * output (e.g. a Bluetooth headset) may still be playing them: the end of the playback, and so
+     * of the turn, waits for this tail so that nothing closing the output cuts the answer short.
+     */
+    protected open val ttsPlaybackTail: Duration
+        get() = Duration.ZERO
 
     /**
      * Suspends until the audio input is routed to the expected device, before the recorder starts
@@ -337,8 +348,9 @@ abstract class AssistViewModelBase(
     }
 
     /**
-     * Plays the TTS answer at [audioPath]. Once the playback completes (without being cancelled),
-     * emits [AssistEvent.PlaybackFinished] and either continues the conversation or finishes the turn.
+     * Plays the TTS answer at [audioPath]. Once the playback completes (without being cancelled) and
+     * its [ttsPlaybackTail] elapsed, emits [AssistEvent.PlaybackFinished] and either continues the
+     * conversation or finishes the turn.
      *
      * @param markPlayingOnStart whether [isPlayingAudio] is set before the player reports it plays
      */
@@ -349,12 +361,18 @@ abstract class AssistViewModelBase(
         onEvent: (AssistEvent) -> Unit,
     ) {
         val usage = ttsPlaybackUsage
+        val tail = ttsPlaybackTail
         val playbackJob = viewModelScope.launch {
             if (markPlayingOnStart) isPlayingAudio = true
+            var played = false
             try {
                 playAudio(audioPath, usage).collect { state ->
-                    if (state == PlaybackState.PLAYING) isPlayingAudio = true
+                    if (state == PlaybackState.PLAYING) {
+                        isPlayingAudio = true
+                        played = true
+                    }
                 }
+                if (played) delay(tail)
             } finally {
                 isPlayingAudio = false
             }

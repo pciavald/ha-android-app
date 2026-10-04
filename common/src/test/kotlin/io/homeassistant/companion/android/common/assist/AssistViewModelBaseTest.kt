@@ -32,13 +32,19 @@ import io.mockk.mockk
 import io.mockk.unmockkAll
 import io.mockk.verify
 import java.net.URL
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.currentTime
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -575,6 +581,74 @@ class AssistViewModelBaseTest {
         verify { audioUrlPlayer.playAudio(any(), AudioUsage.VOICE_COMMUNICATION) }
     }
 
+    @Test
+    fun `Given TTS playback tail When playback ends after RUN_END Then PlaybackFinished and TurnFinished wait for the tail`() = runTest {
+        val playbackStates = MutableSharedFlow<PlaybackState>()
+        setupPlayback(playbackStates)
+        viewModel.playbackTail = 1.seconds
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
+        advanceUntilIdle()
+        playbackStates.emit(PlaybackState.PLAYING)
+        pipelineEventsFlow.emit(createRunEndEvent())
+        advanceUntilIdle()
+        playbackStates.emit(PlaybackState.STOP_PLAYING)
+        runCurrent()
+        advanceTimeBy(999.milliseconds)
+
+        assertEquals(listOf(AssistEvent.PipelineStarted, AssistEvent.PipelineEnded), viewModel.receivedEvents)
+        assertTrue(viewModel.isPlaying)
+
+        advanceTimeBy(2.milliseconds)
+
+        assertEquals(
+            listOf(
+                AssistEvent.PipelineStarted,
+                AssistEvent.PipelineEnded,
+                AssistEvent.PlaybackFinished,
+                AssistEvent.TurnFinished,
+            ),
+            viewModel.receivedEvents,
+        )
+        assertFalse(viewModel.isPlaying)
+    }
+
+    @Test
+    fun `Given TTS playback tail When the player ends without playing Then the turn finishes without waiting`() = runTest {
+        setupPlayback(flowOf(PlaybackState.STOP_PLAYING))
+        viewModel.playbackTail = 1.seconds
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
+        pipelineEventsFlow.emit(createRunEndEvent())
+        runCurrent()
+
+        assertEquals(AssistEvent.TurnFinished, viewModel.receivedEvents.last())
+        assertEquals(0L, currentTime)
+    }
+
+    @Test
+    fun `Given TTS playback tail When playback is stopped during the tail Then PlaybackFinished is not emitted`() = runTest {
+        setupPlayback(flowOf(PlaybackState.PLAYING, PlaybackState.STOP_PLAYING))
+        viewModel.playbackTail = 1.seconds
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+
+        pipelineEventsFlow.emit(createRunStartEvent(42, ttsUrl = "/api/tts_proxy/stream.mp3"))
+        runCurrent()
+        viewModel.callStopPlayback()
+        advanceUntilIdle()
+
+        assertFalse(AssistEvent.PlaybackFinished in viewModel.receivedEvents)
+        assertFalse(viewModel.isPlaying)
+    }
+
     private fun setupPlayback(playbackStates: Flow<PlaybackState>) {
         val connectionStateProvider = mockk<ServerConnectionStateProvider>()
         coEvery { serverManager.connectionStateProvider(any()) } returns connectionStateProvider
@@ -664,9 +738,16 @@ class AssistViewModelBaseTest {
         private var inputMode: AssistInputMode? = null
 
         var playbackUsage = AudioUsage.ASSISTANT
+        var playbackTail = Duration.ZERO
+
+        val isPlaying: Boolean
+            get() = isPlayingAudio
 
         override val ttsPlaybackUsage: AudioUsage
             get() = playbackUsage
+
+        override val ttsPlaybackTail: Duration
+            get() = playbackTail
 
         override suspend fun awaitInputRoute() {
             inputRoute?.await()
@@ -699,6 +780,10 @@ class AssistViewModelBaseTest {
 
         fun callStopRecording(sendRecorded: Boolean = true) {
             stopRecording(sendRecorded)
+        }
+
+        fun callStopPlayback() {
+            stopPlayback()
         }
     }
 }
