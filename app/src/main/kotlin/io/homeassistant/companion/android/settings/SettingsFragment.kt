@@ -1,5 +1,6 @@
 package io.homeassistant.companion.android.settings
 
+import android.Manifest
 import android.app.UiModeManager
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.fragment.app.activityViewModels
@@ -82,6 +84,10 @@ class SettingsFragment(
     private val requestNotificationPermissionResult =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             updateNotificationChannelPrefs()
+        }
+    private val requestBluetoothConnectPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) Timber.w("Bluetooth connect permission denied, headset voice commands use the phone audio")
         }
     private var serverAuth: Int? = null
     private val serverMutex = Mutex()
@@ -179,6 +185,19 @@ class SettingsFragment(
                 addToBackStack(getString(commonR.string.assist))
             }
             return@setOnPreferenceClickListener true
+        }
+
+        findPreference<SwitchPreference>("assist_voice_command_intent")?.setOnPreferenceChangeListener { _, newValue ->
+            // Needed to answer Bluetooth headsets through their own audio; asked here because the
+            // headset only waits a few seconds once it triggers Assist, too short for a dialog
+            if (newValue == true &&
+                SdkVersion.isAtLeast(Build.VERSION_CODES.S) &&
+                ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_CONNECT) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                requestBluetoothConnectPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            true
         }
 
         findPreference<Preference>("gestures")?.setOnPreferenceClickListener {
