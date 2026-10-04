@@ -24,6 +24,7 @@ import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineResponse
 import io.homeassistant.companion.android.common.util.AudioUrlPlayer
 import io.homeassistant.companion.android.common.util.AudioUsage
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -37,6 +38,14 @@ internal val CLOSE_INACTIVE = 30.seconds
 /** Longest a Bluetooth headset turn may keep the headset audio link open. */
 @VisibleForTesting
 internal val HEADSET_SESSION_TIMEOUT = 45.seconds
+
+/**
+ * Time left to a Bluetooth headset to play the end of an answer once the player ended, before its
+ * audio link closes. The player ends when the phone mixed its last samples, but the audio still has
+ * to go through the Bluetooth link and the headset's own buffer, which no API reports.
+ */
+@VisibleForTesting
+internal val HEADSET_PLAYBACK_TAIL = 1.seconds
 
 @HiltViewModel(assistedFactory = AssistViewModel.Factory::class)
 class AssistViewModel @AssistedInject constructor(
@@ -115,6 +124,9 @@ class AssistViewModel @AssistedInject constructor(
 
     override val ttsPlaybackUsage: AudioUsage
         get() = if (headsetSession.isActive) AudioUsage.VOICE_COMMUNICATION else AudioUsage.ASSISTANT
+
+    override val ttsPlaybackTail: Duration
+        get() = if (headsetSession.isActive) HEADSET_PLAYBACK_TAIL else Duration.ZERO
 
     override suspend fun awaitInputRoute() {
         if (headsetSession.isActive) headsetSession.awaitAudioRoute()

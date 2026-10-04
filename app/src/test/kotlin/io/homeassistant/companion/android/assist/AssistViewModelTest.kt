@@ -33,6 +33,7 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import java.net.URL
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
@@ -630,6 +631,32 @@ class AssistViewModelTest {
             runCurrent()
 
             assertFalse(viewModel.shouldFinish)
+        }
+
+        @Test
+        fun `Given active headset session when the answer was played then the session stops only after the playback tail`() = runTest {
+            val playbackStates = MutableSharedFlow<PlaybackState>()
+            setupVoicePipelineWithTts(playbackStates)
+            viewModel = createAndInitialize(hasPermission = true, fromHeadset = true)
+            runCurrent()
+
+            emitTtsEnd()
+            runCurrent()
+            playbackStates.emit(PlaybackState.PLAYING)
+            emitRunEnd()
+            runCurrent()
+            playbackStates.emit(PlaybackState.STOP_PLAYING)
+            runCurrent()
+
+            advanceTimeBy(HEADSET_PLAYBACK_TAIL - 1.milliseconds)
+            runCurrent()
+            assertEquals(0, headsetSession.stopCount)
+            assertFalse(viewModel.shouldFinish)
+
+            advanceTimeBy(1.milliseconds)
+            runCurrent()
+            assertEquals(1, headsetSession.stopCount)
+            assertTrue(viewModel.shouldFinish)
         }
 
         @Test
